@@ -7,7 +7,7 @@ EnOcean Linux Test Program
 ## Get and Build
 
 ```sh
-$ sudo apt install -y git build-essential net-tools libxml2-dev
+$ sudo apt install -y git gcc make build-essential net-tools libxml2-dev
 $ git clone https://github.com/ahidaka/EnOceanLinuxTest.git
 $ cd EnOceanLinuxTest/eotest
 $ make
