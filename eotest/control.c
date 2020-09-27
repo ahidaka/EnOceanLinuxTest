@@ -9,20 +9,18 @@
 #include "eotest.h"
 #include "ptable.h"
 
-#define SC_SIZE 16
-#define NODE_TABLE_SIZE 256
-
-extern void PrintProfileAll(void);
-
+#define NODE_TABLE_SIZE (256) // Number of registerd ID
 //
 // Control file node table
 //
 typedef struct _node_table {
-	UINT Id;
+        unsigned int Id;
         char *Eep;
-	char *Desc;
-	INT SCCount;
-	char **SCuts;
+        char *Desc;
+        int SCCount;
+        char **SCuts;
+        void *Secure; // Pointer to SecureTable
+        int SecureMark;
 } NODE_TABLE;
 
 NODE_TABLE NodeTable[NODE_TABLE_SIZE];
@@ -30,27 +28,23 @@ NODE_TABLE NodeTable[NODE_TABLE_SIZE];
 //
 // Profile cache
 //
-typedef struct _unit {
-        char *SCut;
-	char *Unit;
-	char *DName;
-        INT FromBit;
-        INT SizeBit;
-        double Slope;
-        double Offset;
-} UNIT;
-
 typedef struct _profile_cache {
-        union _eep {
-                char String[8];
-                UINT64 Key;
-        }  Eep;
-	UINT Padding;
+    char StrKey[16];
+    UNIT Unit[SC_SIZE];
+}
+PROFILE_CACHE;
 
-	UNIT Unit[SC_SIZE];
+PROFILE_CACHE CacheTable[NODE_TABLE_SIZE];
 
-} PROFILE_CACHE;
+//
+// Control file node table
+//
+extern void PrintProfileAll(void);
+extern NODE_TABLE NodeTable[];
 
+//
+// static table
+//
 PROFILE_CACHE CacheTable[NODE_TABLE_SIZE];
 
 NODE_TABLE *GetTableId(UINT Target);
@@ -291,18 +285,17 @@ PROFILE_CACHE *GetCache(char *Eep)
 {
 	int i;
 	PROFILE_CACHE *pp = &CacheTable[0];
-        UINT64 *eepKey = (UINT64 *) Eep;
 
-        for(i = 0; i < NODE_TABLE_SIZE; i++) {
-                if (*eepKey == pp->Eep.Key) {
-                        break;
-                }
-                else if (pp->Eep.Key == 0ULL) {
-			// reach to end, not found
-                        return NULL;
-                }
+	for(i = 0; i < NODE_TABLE_SIZE; i++) {
+		if (!strcmp(Eep, pp->StrKey)) {
+			break;
+		}
+		else if (pp->StrKey[0] == '\0') {
+		// reach to end, not found
+			return NULL;
+		}
 		pp++;
-        }
+	}
 	if (i == NODE_TABLE_SIZE) {
 		// not found
 		pp = NULL;
@@ -322,7 +315,33 @@ double CalcB(double x1, double y1, double x2, double y2)
 	return (((double) x1 * y2 - (double) x2 * y1) / (double) (x1 - x2)); 
 }
 
-int AddCache(char *Eep)
+//
+// len <= 32
+//
+ULONG GetBits(IN BYTE *inArray, IN int start, IN int len)
+{
+        ULONG ul = 0UL;
+        const char SZ = 8;
+        const char SEVEN = 7;
+        int startBit = start % SZ;
+        int startByte = start / SZ;
+        BYTE *pb = &inArray[startByte];
+        int i;
+        int pos;
+
+        pos = startBit;
+        for(i = 0; i < len; i++) {
+                ul <<= 1;
+                ul |= (*pb >> (SEVEN - pos++)) & 1;
+                if (pos >= SZ) {
+                        pos = 0;
+                        pb++;
+                }
+        }
+        return ul;
+}
+
+int AddEepCache(char *Eep)
 {
 	EEP_TABLE *pe = GetEep(Eep);
 	DATAFIELD *pd;
@@ -336,8 +355,8 @@ int AddCache(char *Eep)
 		return 0;
 	}
 
-        for(i = 0; i < NODE_TABLE_SIZE; i++) {
-		if (pp->Eep.Key == 0ULL) {
+	for(i = 0; i < NODE_TABLE_SIZE; i++) {
+		if (pp->StrKey[0] == '\0') {
 			// empty slot
 			break;
 		}
@@ -347,8 +366,7 @@ int AddCache(char *Eep)
 		// not found
 		return 0;
 	}
-	pp->Eep.Key = *((UINT64 *) pe->Eep);
-	pp->Padding = 0;
+	strcpy(pp->StrKey, Eep);
 	pu = &pp->Unit[0];
 	pd = &pe->Dtable[0];
 
@@ -359,7 +377,7 @@ int AddCache(char *Eep)
 			pd++;
 			continue;
 		}
-                else if (!strcmp(pd->DataName, "LRN Bit") || !strcmp(pd->ShortCut, "LRNB")
+		else if (!strcmp(pd->DataName, "LRN Bit") || !strcmp(pd->ShortCut, "LRNB")
 			 || !strcmp(pd->DataName, "Learn Button")) {
 			pd++;
 			continue; //Skip Learn bit
@@ -376,9 +394,43 @@ int AddCache(char *Eep)
 		pu++, pd++, points++;
 	}
 
-	PrintProfileAll();
+	//PrintProfileAll();
 
 	return points;
+}
+
+//
+// Read profile table, then check and cache EEP and Model cache
+//
+INT CacheProfiles(VOID)
+{
+	NODE_TABLE *nt;
+	char *eep;
+	int scCount;
+	int lineCount = 0;
+
+	nt = &NodeTable[0];
+
+	while(true) {
+		if (nt->Id == 0) { // found EOL 
+			break;
+		}
+		eep = nt->Eep;
+		if (!GetCache(eep)) {
+			scCount = AddEepCache(eep);
+			if (scCount == 0) {
+				;; //Error("AddEepCache() error");
+			}
+			//printf("*%s: AddEepCache(%s)=%d\n", __FUNCTION__,
+			//       eep, scCount);
+		}
+		nt++;
+		lineCount++;
+	}
+#ifdef EDX_DEBUG
+	printf("**CacheProfiles: count=%d\n", lineCount);
+#endif
+	return lineCount;
 }
 
 int ReadCsv(char *Filename)
@@ -418,14 +470,6 @@ int ReadCsv(char *Filename)
 				Error("Node Table overflow");
 				break;
 			}
-		}
-		if (!GetCache(eep)) {
-			scCount = AddCache(eep);
-			if (scCount == 0) {
-				;; //Error("AddCache() error");
-			}
-			//printf("*%s: AddCache(%s)=%d\n", __FUNCTION__,
-			//       eep, scCount);
 		}
 	}
 	nt->Id = 0; //mark EOL
@@ -527,8 +571,8 @@ void WriteRpsBridgeFile(uint Id, byte *Data)
 		return;
 	}
 	
-        //F6-02-04
-	if (!strcmp(pp->Eep.String, "F6-02-04")) {
+    //F6-02-04
+	if (!strcmp(pp->StrKey, "F6-02-04")) {
 		pu = &pp->Unit[0];
 		rawData = Data[0];
 		for(i = 0; i < nt->SCCount; i++) {
@@ -541,7 +585,7 @@ void WriteRpsBridgeFile(uint Id, byte *Data)
 		}
 	}
 	//F6-02-01
-	else /*if (!strcmp(pp->Eep.String, "F6-02-01")) */ {
+	else /*if (!strcmp(pp->StrKey, "F6-02-01")) */ {
 		BYTE nu = Data[1] & 0x10;
 		BYTE first, second;
 		BYTE eb, sa;
@@ -676,67 +720,39 @@ void WriteVldBridgeFile(uint Id, byte *Data)
 	NODE_TABLE *nt = GetTableId(Id);
 	PROFILE_CACHE *pp;
 	UNIT *pu;
-	ULONG rawData;
-	ULONG partialData;
+	ULONG64 partialData;
 	double convertedData;
-	enum { bitMask = 0xFFFFFFFFFFFFFFFFULL };
-	UINT maxBitOffset;
-	UINT tmpBitOffset;
-	UINT actualByteSize;
 	char *fileName;
-#define SIZE_MASK(n) (bitMask >> (64 - (n)))
 
-	//printf("*%s: %08X data=%02X %02X %02X %02X %02X %02X scnt=%d\n", __FUNCTION__,
-	//       Id, Data[0], Data[1], Data[2], Data[3], Data[4], Data[5], nt->SCCount);
-
+#if VLD_DEBUG
+	printf("*%s: %08X data=%02X %02X %02X %02X %02X %02X scnt=%d\n", __FUNCTION__,
+	       Id, Data[0], Data[1], Data[2], Data[3], Data[4], Data[5], nt->SCCount);
+#endif
 	if (nt == NULL) {
 		Error("cannot find id");
 		return;
 	}
 	pp = GetCache(nt->Eep);
 	if (pp == NULL) {
-		Error("cannot find EEP");
+		//Error("cannot find EEP");
+		printf("cannot find EEP=%s\n", nt->Eep);
 		return;
 	}
 
-	// Examine the total byte counts in VLD data packet
-	maxBitOffset = 0;
-	pu = &pp->Unit[0];
-	for(i = 0; i < nt->SCCount; i++) {
-		tmpBitOffset = pu->FromBit + pu->SizeBit - 1;
-		if (maxBitOffset < tmpBitOffset) {
-			maxBitOffset = tmpBitOffset;
-		}
-		pu++;
-	}
-	actualByteSize = (maxBitOffset + 7) / 8;
+	//LogMessageStart(Id, pp->StrKey, nt->Secure ? "!" : "");
 
-	rawData = Data[0];
-	// Caluculate the raw data word;
-	for(i = 1; i < actualByteSize; i++) {
-		//printf("**** rawData=%lx\n", rawData);
-		rawData <<= 8;
-		//printf("**** rawData=%lx\n", rawData);
-		rawData |= Data[i];
-		//printf("**** rawData=%lx\n", rawData);
-	}
-	//printf("**** maxBitOffset=%u actualByteSize=%u rawData=%lu(0x%0lx)\n",
-	//       maxBitOffset, actualByteSize, rawData, rawData);
 	pu = &pp->Unit[0];
 	for(i = 0; i < nt->SCCount; i++) {
-		int maxBitPos = actualByteSize * 8 -1;
-		int newFromBit = maxBitPos - (pu->FromBit + pu->SizeBit - 1);
 
 		fileName = nt->SCuts[i];
-		partialData = (rawData >> newFromBit) & SIZE_MASK(pu->SizeBit);
-
-                // SIZE_MASK(n) (bitMask >> (64 - (n)))		
-		//printf("****SIZE_MASK=%lx\n", SIZE_MASK(pu->SizeBit));
-
-		convertedData = partialData * pu->Slope + pu->Offset;
-		//printf("****%s:R=%lu PD=%lu fr=%u nw=%u sz=%u sl=%.2lf of=%.2lf dt=%.2lf\n",
-		//       fileName, rawData, partialData, pu->FromBit, newFromBit, pu->SizeBit,
-		//       pu->Slope, pu->Offset, convertedData);
+		partialData = GetBits(&Data[0], pu->FromBit, pu->SizeBit);
+		convertedData = pu->ValueType == VT_Data ? partialData * pu->Slope + pu->Offset : partialData;
+#if VLD_DEBUG
+		printf("****%s:PD=%llu tp=%u fr=%u sz=%u sl=%.2lf of=%.2lf dt=%.2lf\n",
+		       fileName, partialData, pu->ValueType, pu->FromBit, pu->SizeBit,
+		       pu->Slope, pu->Offset, convertedData);
+#endif
+		//WriteBridge(fileName, convertedData, pu->Unit);
 		WriteBridge(fileName, convertedData);
 
 		//printf("*%d: %s.%s=%lu/%.2lf,f=%u z=%u s=%.2lf o=%.2lf\n", i,
@@ -745,7 +761,6 @@ void WriteVldBridgeFile(uint Id, byte *Data)
 		//       pu->Slope, pu->Offset);
 		pu++;
 	}
-#undef SIZE_MASK
 }
 
 int PrintPoint(char *Eep, int Count)
@@ -754,7 +769,7 @@ int PrintPoint(char *Eep, int Count)
         UNIT *pu;
         int i;
 
-	printf("*PP:pp=%p(%s) eep=%s cnt=%d\n", pp, pp->Eep.String, Eep, Count); 
+	printf("*PP:pp=%p(%s) eep=%s cnt=%d\n", pp, pp->StrKey, Eep, Count); 
 
         pu = &pp->Unit[0];
         for(i = 0; i < Count; i++) {
@@ -825,7 +840,7 @@ void PrintProfileAll()
 	UNIT *pu;
 
 	for(i = 0; i < NODE_TABLE_SIZE; i++) {
-		printf("*%s: %d: %s %p\n", __FUNCTION__, i, pp->Eep.String, &pp->Unit[0]);
+		printf("*%s: %d: %s %p\n", __FUNCTION__, i, pp->StrKey, &pp->Unit[0]);
 		
 		pu = &pp->Unit[0];
 		for(j = 0; j < SC_SIZE; j++) {
@@ -836,7 +851,7 @@ void PrintProfileAll()
 			pu++;
 		}
 		pp++;
-		if (pp->Eep.Key == 0ULL)
+		if (pp->StrKey == 0ULL)
 			break;
 	}
 }

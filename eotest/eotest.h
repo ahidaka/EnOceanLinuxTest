@@ -105,6 +105,8 @@ bool CheckTableEep(char *Target);
 
 char *GetNewName(char *Target);
 
+int CacheProfiles(void);
+
 int ReadCsv(char *Filename);
 
 int ReadCmd(char *Filename, int *Mode, char *Param);

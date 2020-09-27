@@ -21,7 +21,7 @@
 #include "esp3.h"
 
 static const char copyright[] = "\n(c) 2017 Device Drivers, Ltd. \n";
-static const char version[] = "\n@ eotest Version 1.01 \n";
+static const char version[] = "\n@ eotest Version 1.05 \n";
 
 #define EO_ESP_PORT_USB "/dev/ttyUSB0"
 #define EO_ESP_PORT_S0 "/dev/ttyS0"
@@ -71,21 +71,33 @@ static const char version[] = "\n@ eotest Version 1.01 \n";
 
 #define INCREMENT(a) ((a) = (((a)+1) & 0x7FFFFFFF))
 
+
+#define QueueSetLength(Buf, Len) \
+	((QUEUE_ENTRY *)((Buf) - offsetof(QUEUE_ENTRY, Data)))->Length = (Len)
+
+#define QueueGetLength(Buf) \
+	(((QUEUE_ENTRY *)((Buf) - offsetof(QUEUE_ENTRY, Data)))->Length)
+
 //typedef struct QueueHead {...} QEntry;
 STAILQ_HEAD(QueueHead, QEntry);
 typedef struct QueueHead QUEUE_HEAD;
 
 struct QEntry {
-        int Number;
-        struct timespec TimeStamp;
-        BYTE Data[DATABUFSIZ];
-        STAILQ_ENTRY(QEntry) Entries;
+	STAILQ_ENTRY(QEntry) Entries;
+	int Number;
+	INT Length;
+	BYTE Data[DATABUFSIZ];
 };
 typedef struct QEntry QUEUE_ENTRY;
 
 QUEUE_HEAD DataQueue;     // Received Data
 QUEUE_HEAD ResponseQueue; // CO Command Responce
 QUEUE_HEAD ExtraQueue;    // Event, Smack, etc currently not used
+QUEUE_HEAD FreeQueue;     // Free buffer
+
+static const INT FreeQueueCount = 8;
+static const INT QueueTryTimes = 10;
+static const INT QueueTryWait = 2; //msec
 
 //
 //
@@ -224,46 +236,37 @@ bool MainJob(BYTE *Buffer);
 //
 //
 //
-int Enqueue(QUEUE_HEAD *Queue, BYTE *Buffer)
+INT Enqueue(QUEUE_HEAD *Queue, BYTE *Buffer)
 {
-        QUEUE_ENTRY *newEntry = NULL;
+	QUEUE_ENTRY *qEntry;
+	const size_t offset = offsetof(QUEUE_ENTRY, Data);
 
-        //printf("**Enqueue:%p\n", Buffer);
-        newEntry = (struct QEntry *) malloc(sizeof(struct QEntry));
-        if (newEntry == NULL) {
-                printf("**ERROR at Enqueue\n");
-                return 0;
-        }
-        pthread_mutex_lock(&Queue->lock);
-        newEntry->Number = INCREMENT(Queue->num_control);
-        memcpy(newEntry->Data, Buffer, DATABUFSIZ);
+	qEntry = (QUEUE_ENTRY *)(Buffer - offset);
 
-        STAILQ_INSERT_TAIL(Queue, newEntry, Entries);
-        pthread_mutex_unlock(&Queue->lock);
-        //printf("**Enqueue:%p=%d (%p)\n", newEntry->Data, newEntry->Number, newEntry);
+	pthread_mutex_lock(&Queue->lock);
+	qEntry->Number = INCREMENT(Queue->num_control);
 
-        return Queue->num_control;
+	STAILQ_INSERT_TAIL(Queue, qEntry, Entries);
+	pthread_mutex_unlock(&Queue->lock);
+
+	return Queue->num_control;
 }
 
 BYTE *Dequeue(QUEUE_HEAD *Queue)
 {
-        QUEUE_ENTRY *entry;
-        BYTE *buffer;
-        //int num;
+	QUEUE_ENTRY *entry;
+	BYTE *buffer;
 
-        if (STAILQ_EMPTY(Queue)) {
-                //printf("**Dequeue Empty!\n");
-                return NULL;
-        }
-        pthread_mutex_lock(&Queue->lock);
-        entry = STAILQ_FIRST(Queue);
-        buffer = entry->Data;
-        //num = entry->Number;
-        STAILQ_REMOVE(Queue, entry, QEntry, Entries);
-        pthread_mutex_unlock(&Queue->lock);
+	if (STAILQ_EMPTY(Queue)) {
+		return NULL;
+	}
+	pthread_mutex_lock(&Queue->lock);
+	entry = STAILQ_FIRST(Queue);
+	buffer = entry->Data;
+	STAILQ_REMOVE(Queue, entry, QEntry, Entries);
+	pthread_mutex_unlock(&Queue->lock);
 
-        //printf("**Dequeue list(%d):%p\n", num, buffer);
-        return buffer;
+	return buffer;
 }
 
 void StartJobs(CMD_PARAM *Param)
@@ -282,89 +285,112 @@ void Shutdown(CMD_PARAM *Param)
 }
 
 //
-void QueueData(QUEUE_HEAD *Queue, BYTE *DataBuffer, int Length)
+VOID QueueData(QUEUE_HEAD *Queue, BYTE *DataBuffer, int Length)
 {
-        BYTE *queueBuffer;
+	QueueSetLength(DataBuffer, Length);
+	Enqueue(Queue, DataBuffer);
+}
 
-        queueBuffer = calloc(DATABUFSIZ, 1);
-        if (queueBuffer == NULL) {
-                fprintf(stderr, "calloc error\n");
-                return;
-        }
-        memcpy(queueBuffer, DataBuffer, Length);
-        Enqueue(Queue, queueBuffer);
+VOID FreeQueueInit(VOID)
+{
+	INT i;
+	struct QEntry *freeEntry;
+
+	for(i = 0; i < FreeQueueCount; i++) {
+		freeEntry = (struct QEntry *) calloc(sizeof(struct QEntry), 1);
+		if (freeEntry == NULL) {
+			fprintf(stderr, "FreeQueueInit: calloc error=%d\n", i);
+			return;
+		}
+		Enqueue(&FreeQueue, freeEntry->Data);
+	}
 }
 
 void *ReadThread(void *arg)
 {
-        EO_CONTROL *p = &EoControl;
-        int fd = GetFd();
-        ESP_STATUS rType;
-        BYTE dataBuffer[DATABUFSIZ];
-        USHORT  dataLength = 0;
-        BYTE   optionLength = 0;
-        BYTE   packetType = 0;
-        BYTE   dataType;
-        int    totalLength;
+	EO_CONTROL *p = &EoControl;
+	int fd = GetFd();
+	ESP_STATUS rType;
+	BYTE   *dataBuffer;
+	USHORT  dataLength = 0;
+	BYTE   optionLength = 0;
+	BYTE   packetType = 0;
+	BYTE   dataType;
+	INT    totalLength;
+	INT count = 0;
 
-        //printf("**ReadThread()\n");
-        while(!stop_read) {
-                read_ready = TRUE;
-                rType = GetPacket(fd, dataBuffer, (USHORT) DATABUFSIZ);
-                if (stop_job) {
-                        //printf("**ReadThread breaked by stop_job-1\n");
-                        break;
-                }
-                else if (rType == OK) {
+    //printf("**ReadThread()\n");
+	while(!stop_read) {
 
-                        dataLength = (dataBuffer[0] << 8) + dataBuffer[1];
-                        optionLength = dataBuffer[2];
-                        packetType = dataBuffer[3];
-                        dataType = dataBuffer[5];
-                        totalLength = HEADER_SIZE + dataLength + optionLength + CRC8D_SIZE;
+		do {
+			dataBuffer = Dequeue(&FreeQueue);
+			if (dataBuffer == NULL) {
+				if (QueueTryTimes >= count) {
+					fprintf(stderr, "ReadThread: FreeQueue empty\n");
+					return (void*) NULL;
+				}
+				count++;
+				msleep(QueueTryWait);
+			}
+		}
+		while(dataBuffer == NULL);
 
-			if (p->Debug > 0)
+		read_ready = TRUE;
+		rType = GetPacket(fd, dataBuffer, (USHORT) DATABUFSIZ);
+		if (stop_job) {
+			//printf("**ReadThread breaked by stop_job-1\n");
+			break;
+		}
+		else if (rType == OK) {
+			dataLength = (dataBuffer[0] << 8) + dataBuffer[1];
+			optionLength = dataBuffer[2];
+			packetType = dataBuffer[3];
+			dataType = dataBuffer[5];
+			totalLength = HEADER_SIZE + dataLength + optionLength + CRC8D_SIZE;
+
+			if (p->Debug > 0) {
 				printf("dLen=%d oLen=%d tot=%d typ=%02X dat=%02X\n",
-				       dataLength,
-				       optionLength,
-				       totalLength,
-				       packetType,
-				       dataType);
-                }
-                else {
-                        printf("invalid rType==%02X\n\n", rType);
-                }
+					dataLength,
+					optionLength,
+					totalLength,
+					packetType,
+					dataType);
+			}
+		}
+		else {
+			printf("invalid rType==%02X\n\n", rType);
+		}
 
-                if (stop_job) {
-                        printf("**ReadThread breaked by stop_job-2\n");
-                        break;
-                }
-                //printf("**ReadTh: process=%d\n", packetType);
+		if (stop_job) {
+			printf("**ReadThread breaked by stop_job-2\n");
+			break;
+		}
+		//printf("**ReadTh: process=%d\n", packetType);
 
-                switch (packetType) {
-                case RADIO_ERP1: //1  Radio telegram
-                case RADIO_ERP2: //0x0A ERP2 protocol radio telegram
-                        QueueData(&DataQueue, dataBuffer, totalLength);
-                        break;
-                case RESPONSE: //2 Response to any packet
-                        QueueData(&ResponseQueue, dataBuffer, totalLength);
-                        break;
-                case RADIO_SUB_TEL: //3 Radio subtelegram
-                case EVENT: //4 Event message
-                case COMMON_COMMAND: //5 Common command
-                case SMART_ACK_COMMAND: //6 Smart Ack command
-                case REMOTE_MAN_COMMAND: //7 Remote management command
-                case RADIO_MESSAGE: //9 Radio message
-                case CONFIG_COMMAND: //0x0B ESP3 configuration
-                default:
-                        QueueData(&ExtraQueue, dataBuffer, totalLength);
-                        fprintf(stderr, "Unknown packet=%d\n", packetType);
-                        break;
-                }
-        }
+		switch (packetType) {
+		case RADIO_ERP1: //1  Radio telegram
+		case RADIO_ERP2: //0x0A ERP2 protocol radio telegram
+			QueueData(&DataQueue, dataBuffer, totalLength);
+			break;
+		case RESPONSE: //2 Response to any packet
+			QueueData(&ResponseQueue, dataBuffer, totalLength);
+			break;
+		case RADIO_SUB_TEL: //3 Radio subtelegram
+		case EVENT: //4 Event message
+		case COMMON_COMMAND: //5 Common command
+		case SMART_ACK_COMMAND: //6 Smart Ack command
+		case REMOTE_MAN_COMMAND: //7 Remote management command
+		case RADIO_MESSAGE: //9 Radio message
+		case CONFIG_COMMAND: //0x0B ESP3 configuration
+		default:
+			QueueData(&ExtraQueue, dataBuffer, totalLength);
+			fprintf(stderr, "Unknown packet=%d\n", packetType);
+			break;
+		}
+	}
 
-        //printf("ReadThread end=%d stop_read=%d\n", stop_job, stop_read);
-        return (void*) NULL;
+	//printf("ReadThread end=%d stop_read=%d\n", stop_job, stop_read);
+	return (void*) NULL;
 }
 
 void Analyze(BYTE *Buffer)
@@ -383,29 +409,25 @@ void Analyze(BYTE *Buffer)
 //
 void *ActionThread(void *arg)
 {
-        byte *data;
-        size_t offset;
-        QUEUE_ENTRY *qentry;
-        BYTE buffer[DATABUFSIZ];
+	byte *data;
 
-        while(!stop_action && !stop_job) {
-                data = Dequeue(&DataQueue);
-                if (data == NULL)
-                        msleep(1);
-                else {
-                        memcpy(buffer, data, DATABUFSIZ);
-                        offset = offsetof(QUEUE_ENTRY, Data);
-                        qentry = (QUEUE_ENTRY *)(data - offset);
-                        //printf("##%s: free=%p\n", __func__, qentry);
-                        free(qentry);
-
-                        Analyze(buffer);
-			MainJob(buffer);
-                }
-        }
-        //printf("##ActionThread() end=%d %d \n", stop_action, stop_job);
-        return OK;
-
+	while(!stop_action && !stop_job) {
+		data = Dequeue(&DataQueue);
+		if (data == NULL) {
+			msleep(1);
+		}
+		else {
+			MainJob(data);
+			Enqueue(&FreeQueue, data);
+		}
+		// Check for ExtraQueue
+		data = Dequeue(&ExtraQueue);
+		if (data != NULL) {
+			// Currently nothing to do
+			Enqueue(&FreeQueue, data);
+		}
+	}
+	return OK;
 }
 
 BOOL InitSerial(OUT int *pFd)
@@ -418,9 +440,9 @@ BOOL InitSerial(OUT int *pFd)
 	};
 	char *pp;
 	int i;
-        EO_CONTROL *p = &EoControl;
-        int fd;
-        struct termios tio;
+	EO_CONTROL *p = &EoControl;
+	int fd;
+	struct termios tio;
 
 	if (p->ESPPort[0] == '\0') {
 		// default, check for available port
@@ -436,29 +458,31 @@ BOOL InitSerial(OUT int *pFd)
 		}
 	}
 
-        if (p->ESPPort && p->ESPPort[0] == '\0') {
-                fprintf(stderr, "PORT access admission needed.\n");
+	if (p->ESPPort && p->ESPPort[0] == '\0') {
+		fprintf(stderr, "Serial: PORT access admission needed.\n");
 		return 1;
 	}
-        else if ((fd = open(p->ESPPort, O_RDWR)) < 0) {
-                fprintf(stderr, "open error:%s\n", p->ESPPort);
-                return 1 ;
-        }
-        bzero((void *) &tio, sizeof(tio));
-        //tio.c_cflag = B57600 | CRTSCTS | CS8 | CLOCAL | CREAD;
-        tio.c_cflag = B57600 | CS8 | CLOCAL | CREAD;
-        tio.c_cc[VTIME] = 0; // no timer
-        tio.c_cc[VMIN] = 1; // at least 1 byte
-        //tcsetattr(fd, TCSANOW, &tio);
-        cfsetispeed( &tio, B57600 );
-        cfsetospeed( &tio, B57600 );
+	else if ((fd = open(p->ESPPort, O_RDWR)) < 0) {
+		fprintf(stderr, "Serial: open error:%s\n", p->ESPPort);
+		return 1 ;
+	}
+	bzero((void *) &tio, sizeof(tio));
+	//tio.c_cflag = B57600 | CRTSCTS | CS8 | CLOCAL | CREAD;
+	tio.c_cflag = B57600 | CS8 | CLOCAL | CREAD;
+	tio.c_cc[VTIME] = 0; // no timer
+	tio.c_cc[VMIN] = 1; // at least 1 byte
+	//tcsetattr(fd, TCSANOW, &tio);
+	cfsetispeed( &tio, B57600 );
+	cfsetospeed( &tio, B57600 );
 
-        cfmakeraw(&tio);
-        tcsetattr( fd, TCSANOW, &tio );
-        ioctl(fd, TCSETS, &tio);
-        *pFd = fd;
+	cfmakeraw(&tio);
+	tcsetattr( fd, TCSANOW, &tio );
+	ioctl(fd, TCSETS, &tio);
+	*pFd = fd;
 
-        return 0;
+	printf("ESP port: %s\n", p->ESPPort);
+
+	return 0;
 }
 
 //
@@ -467,60 +491,57 @@ BOOL InitSerial(OUT int *pFd)
 //
 ESP_STATUS GetResponse(OUT BYTE *Buffer)
 {
-        INT startMSec;
-        INT timeout;
-        BYTE *data;
-        size_t offset;
-        QUEUE_ENTRY *qentry;
-        ESP_STATUS responseMessage;
+	INT startMSec;
+	INT timeout;
+	INT length;
+	BYTE *data;
+	ESP_STATUS responseMessage;
 
-        startMSec = SystemMSec();
-        do {
-                data = Dequeue(&ResponseQueue);
-                timeout = SystemMSec() - startMSec;
-                if (data != NULL) {
-                        //printf("**GetResponse() Got=%d\n", timeout);
-                        memcpy(Buffer, data, DATABUFSIZ);
-                        offset = offsetof(QUEUE_ENTRY, Data);
-                        qentry = (QUEUE_ENTRY *)(data - offset);
-                        //printf("**%s: free=%p\n", __func__, qentry);
-                        free(qentry);
-                        break;
-                }
-                if (timeout > RESPONSE_TIMEOUT)
-                {
-                        printf("****GetResponse() Timeout=%d\n", timeout);
-                        return TIMEOUT;
-                }
-                msleep(1);
-        }
-        while(1);
+	startMSec = SystemMSec();
+	do {
+		data = Dequeue(&ResponseQueue);
+		if (data != NULL) {
+				break;
+		}
+		timeout = SystemMSec() - startMSec;
+		if (timeout > RESPONSE_TIMEOUT)
+		{
+			fprintf(stderr, "GetResponse: Timeout=%d\n", timeout);					
+			return TIMEOUT;
+		}
+		msleep(1);
+	}
+	while(1);
 
-        switch(Buffer[5]) {
-        case 0:
-        case 1:
-        case 2:
-        case 3:
-                responseMessage = Buffer[5];
-                break;
-        default:
-                responseMessage = INVALID_STATUS;
-                break;
-        }
+	length = QueueGetLength(data);
+	memcpy(Buffer, data, length);
+	Enqueue(&FreeQueue, data);
 
-        PacketDump(Buffer);
-        printf("**GetResponse=%d\n", responseMessage);
-        return responseMessage;
+	switch(Buffer[5]) {
+	case 0:
+	case 1:
+	case 2:
+	case 3:
+		responseMessage = Buffer[5];
+		break;
+	default:
+		responseMessage = INVALID_STATUS;
+		break;
+	}
+
+	//PacketDump(Buffer);
+	//printf("**GetResponse=%d\n", responseMessage);
+	return responseMessage;
 }
 
 //
 //
 void SendCommand(BYTE *cmdBuffer)
 {
-        int length = cmdBuffer[2] + 7;
-        //printf("**SendCommand fd=%d len=%d\n", GetFd(), length);
+	int length = cmdBuffer[2] + 7;
+	//printf("**SendCommand fd=%d len=%d\n", GetFd(), length);
 
-        write(GetFd(), cmdBuffer, length);
+	write(GetFd(), cmdBuffer, length);
 }
 
 //
@@ -576,24 +597,27 @@ char *MakePath(char *Dir, char *File)
 int EoReadControl()
 {
 	EO_CONTROL *p = &EoControl;
+	int csvCount;
 
 	if (p->ControlPath == NULL) {
 		p->ControlPath = MakePath(p->BridgeDirectory, p->ControlFile); 
 	}
-	return( ReadCsv(p->ControlPath) );
+	csvCount = ReadCsv(p->ControlPath);
+	(void) CacheProfiles();
+	return csvCount;
 }
 
 void EoClearControl()
 {
-        EO_CONTROL *p = &EoControl;
+	EO_CONTROL *p = &EoControl;
 
  	if (p->ControlPath == NULL) {
 		p->ControlPath = MakePath(p->BridgeDirectory, p->ControlFile); 
 	}
-        if (truncate(p->ControlPath, 0)) {
-		fprintf(stderr, "%s: truncate error=%s\n", __FUNCTION__,
-			p->ControlPath);
-        }
+	if (truncate(p->ControlPath, 0)) {
+	fprintf(stderr, "%s: truncate error=%s\n", __FUNCTION__,
+		p->ControlPath);
+	}
 	p->ControlCount = 0;
 }
 
@@ -914,10 +938,8 @@ void EoReloadControlFile()
 	if (p->ControlPath == NULL) {
 		p->ControlPath = MakePath(p->BridgeDirectory, p->ControlFile); 
 	}
-	//if (p->ControlCount < 0) {
-	// ControlFile is updated 
 	p->ControlCount = ReadCsv(p->ControlPath);
-	//}
+	(void) CacheProfiles();
 }
 
 //
@@ -1346,9 +1368,12 @@ int main(int ac, char **av)
         STAILQ_INIT(&DataQueue);
         STAILQ_INIT(&ResponseQueue);
         STAILQ_INIT(&ExtraQueue);
+		STAILQ_INIT(&FreeQueue);
+		FreeQueueInit();
         pthread_mutex_init(&DataQueue.lock, NULL);
         pthread_mutex_init(&ResponseQueue.lock, NULL);
         pthread_mutex_init(&ExtraQueue.lock, NULL);
+		pthread_mutex_init(&FreeQueue.lock, NULL);
 
         if (InitSerial(&fd)) {
                 fprintf(stderr, "InitSerial error\n");
