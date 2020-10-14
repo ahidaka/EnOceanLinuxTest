@@ -3,17 +3,17 @@
 TARGET = eotest
 
 IFLAGS = -I/usr/include/libxml2
-CFLAGS = -g -Wall $(IFLAGS)
+CFLAGS = -g -Wall -Wno-parentheses -Wno-unused-function -Wno-format-overflow $(IFLAGS)
 
 all: $(TARGET)
 
 eotest: eotest.o ptable.o control.o serial.o esp3.o
 	gcc $(CFLAGS) eotest.o esp3.o ptable.o control.o serial.o -o eotest -lpthread -lxml2
 
-eotest.o: eotest.c eotest.h ptable.h serial.h esp3.h
+eotest.o: eotest.c eotest.h ptable.h serial.h esp3.h ptable_extra.inc
 	gcc $(CFLAGS) -c eotest.c
 
-ptable.o: ptable.c eotest.h ptable.h
+ptable.o: ptable.c eotest.h ptable.h ptable_extra.inc
 	gcc $(CFLAGS) -c ptable.c
 
 control.o: control.c eotest.h
